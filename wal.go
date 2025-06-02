@@ -5,10 +5,14 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -207,4 +211,206 @@ func (wal *WAL) Sync() error {
 // resetTimer resets the syncronization timer.
 func (wal *WAL) resetTimer() {
 	wal.syncTimer.Reset(syncInterval)
+}
+
+// Close closes the WAL files and calls sync on the WAL
+func (wal *WAL) Close() error {
+	wal.cancel()
+	err := wal.Sync()
+	if err != nil {
+		return err
+	}
+	return wal.currentSegment.Close()
+}
+
+// WriteEntry writes an entry to the WAL
+func (wal *WAL) WriteEntry(data []byte) error {
+	return wal.writeEntry(data, false)
+}
+
+func (wal *WAL) writeEntry(data []byte, isCheckpoint bool) error {
+	wal.lock.Lock()
+	defer wal.lock.Unlock()
+	err := wal.rotateLogIfNeeded()
+	if err != nil {
+		return err
+	}
+
+	wal.lastSequenceNumber++
+	entry := &WAL_Entry{
+		LogSequenceNumber: wal.lastSequenceNumber,
+		Data:              data,
+		CRC:               crc32.ChecksumIEEE(append(data, byte(wal.lastSequenceNumber))),
+	}
+
+	if isCheckpoint {
+		err = wal.Sync()
+		if err != nil {
+			return err
+		}
+		entry.IsCheckpoint = &isCheckpoint
+	}
+
+	return wal.writeEntryToBuffer(entry)
+}
+
+func (wal *WAL) rotateLogIfNeeded() error {
+	fileInfo, err := wal.currentSegment.Stat()
+	if err != nil {
+		return err
+	}
+
+	if fileInfo.Size()+int64(wal.bufWriter.Buffered()) >= wal.maxFileSize {
+		err := wal.rotateLog()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (wal *WAL) rotateLog() error {
+	err := wal.Sync()
+	if err != nil {
+		return err
+	}
+
+	err = wal.currentSegment.Close()
+	if err != nil {
+		return err
+	}
+
+	wal.currentSegmentIndex++
+	if wal.currentSegmentIndex >= wal.maxSegments {
+		err := wal.deleteOldestSegment()
+		if err != nil {
+			return nil
+		}
+	}
+
+	newFile, err := createSegmentFile(wal.directory, wal.currentSegmentIndex)
+	if err != nil {
+		return err
+	}
+
+	wal.currentSegment = newFile
+	wal.bufWriter = bufio.NewWriter(newFile)
+
+	return nil
+}
+
+// deleteOldestSegment removes the oldest log file
+func (wal *WAL) deleteOldestSegment() error {
+	files, err := filepath.Glob(filepath.Join(wal.directory, segmentPrefix+"*"))
+	if err != nil {
+		return err
+	}
+
+	var oldestSegmentFilePath string
+	if len(files) > 0 {
+		// find the oldest segment ID
+		oldestSegmentFilePath, err = wal.findOldestSegmentFile(files)
+		if err != nil {
+			return err
+		}
+	} else {
+		return nil
+	}
+
+	// delete the oldest segment file
+	err = os.Remove(oldestSegmentFilePath)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (wal *WAL) findOldestSegmentFile(files []string) (string, error) {
+	var oldestSegmentFilePath string
+	oldestSegmentID := math.MaxInt64
+	for _, file := range files {
+		// get the segment index from the filename
+		segmentIndex, err := strconv.Atoi(strings.TrimPrefix(file, filepath.Join(wal.directory, segmentPrefix)))
+
+		if err != nil {
+			return "", err
+		}
+		if segmentIndex < oldestSegmentID {
+			oldestSegmentID = segmentIndex
+			oldestSegmentFilePath = file
+		}
+	}
+
+	return oldestSegmentFilePath, nil
+}
+
+func (wal *WAL) writeEntryToBuffer(entry *WAL_Entry) error {
+	marshaledEntry := MustMarshal(entry)
+
+	size := int32(len(marshaledEntry))
+	err := binary.Write(wal.bufWriter, binary.LittleEndian, size)
+	if err != nil {
+		return err
+	}
+	_, err = wal.bufWriter.Write(marshaledEntry)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReadAll reads all the entries from the WAL. if readFromCheckpoint is true, it will return
+// all the entries from the last checkpoint. If no entries, found it will return an empty slice
+func (wal *WAL) ReadAll(readFromCheckpoint bool) ([]*WAL_Entry, error) {
+	file, err := os.OpenFile(wal.currentSegment.Name(), os.O_RDONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	entries, checkpoint, err := readAllEntriesFromFile(file, readFromCheckpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	if readFromCheckpoint && checkpoint <= 0 {
+		return entries[:0], nil
+	}
+	return entries, nil
+}
+
+func readAllEntriesFromFile(file *os.File, readFromCheckpoint bool) ([]*WAL_Entry, uint64, error) {
+	var entries []*WAL_Entry
+	checkpointLogSequenceNo := uint64(0)
+	for {
+		var size int32
+		err := binary.Read(file, binary.LittleEndian, &size)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return entries, checkpointLogSequenceNo, err
+		}
+
+		data := make([]byte, size)
+		_, err = io.ReadFull(file, data)
+		if err != nil {
+			return entries, checkpointLogSequenceNo, err
+		}
+
+		entry, err := unmarshalAndVerifyEntry(data)
+		if err != nil {
+			return entries, checkpointLogSequenceNo, err
+		}
+
+		// if we are reading from checkpoint and we find a checkpoint entry, we should return the entries from the last checkpoint. For that we are emptying the entries slice and start appending from that checkpoint
+		if entry.IsCheckpoint != nil && entry.GetIsCheckpoint() {
+			checkpointLogSequenceNo = entry.GetLogSequenceNumber()
+			// emptying the entries slice
+			entries = entries[:0]
+		}
+		entries = append(entries, entry)
+
+	}
+	return entries, checkpointLogSequenceNo, nil
 }
