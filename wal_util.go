@@ -2,6 +2,7 @@ package wal
 
 import (
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,4 +31,20 @@ func createSegmentFile(directory string, segmentID int) (*os.File, error){
 		return nil, err
 	}
 	return file, nil
+}
+
+func unmarshalAndVerifyEntry(data []byte) (*WAL_Entry, error){
+	var entry WAL_Entry
+	MustUnmarshal(data, &entry)
+	verified := verifyCRC(&entry)
+	if !verified{
+		return nil, fmt.Errorf("CRC mismatched: data must be corrupted")
+	}
+
+	return &entry, nil
+}
+
+func verifyCRC(entry *WAL_Entry) bool {
+	actualCRC := crc32.ChecksumIEEE(append(entry.GetData(), byte(entry.GetLogSequenceNumber())))
+	return actualCRC == entry.CRC
 }
