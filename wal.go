@@ -546,3 +546,57 @@ func (wal *WAL) replaceWithFixedFile(entries []*WAL_Entry) error {
 
 	return nil
 }
+
+// ReadAllFromOffset starts reading from log segment files starting from the given offset
+// (Segment Index) and returns all the entries. If readFromCheckpoint is true,
+// it will return all the entries from the last checkpoint (if no checkpoint is
+// found, it will return an empty slice.)
+func (wal *WAL) ReadAllFromOffset(offset int, readFromCheckpoint bool) ([]*WAL_Entry, error) {
+	// Get the list of log segment files in the directory
+	files, err := filepath.Glob(filepath.Join(wal.directory, segmentPrefix+"*"))
+	if err != nil {
+		return nil, err
+	}
+
+	var entries []*WAL_Entry
+	prevCheckpointLogSequenceNo := uint64(0)
+
+	for _, file := range files {
+		// Get the segment index from the file name
+		segmentIndex, err := strconv.Atoi(strings.TrimPrefix(file,
+			filepath.Join(wal.directory, "segment-")))
+		if err != nil {
+			return entries, err
+		}
+
+		if segmentIndex < offset {
+			continue
+		}
+
+		file, err := os.OpenFile(file, os.O_RDONLY, 0644)
+		if err != nil {
+			return nil, err
+		}
+
+		entries_from_segment, checkpoint, err := readAllEntriesFromFile(file, readFromCheckpoint)
+		if err != nil {
+			return entries, err
+		}
+
+		if readFromCheckpoint && checkpoint > prevCheckpointLogSequenceNo {
+			entries = entries[:0]
+			prevCheckpointLogSequenceNo = checkpoint
+		}
+
+		entries = append(entries, entries_from_segment...)
+	}
+
+	return entries, nil
+}
+
+// CreateCheckpoint creates a checkpoint entry in the WAL. A checkpoint entry
+// is a special entry that can be used to restore the state of the system to
+// the point when the checkpoint was created.
+func (wal *WAL) CreateCheckpoint(data []byte) error {
+	return wal.writeEntry(data, true)
+}
